@@ -37,7 +37,7 @@ class DataStorage(ABC):
     """Interface implemented by crawler storage backends."""
 
     @abstractmethod
-    async def save(self, data: dict) -> None:
+    async def save(self, data: dict) -> int:
         """Persist one standardized page record."""
 
     @abstractmethod
@@ -101,6 +101,7 @@ class JSONStorage(DataStorage):
                     await output.write(prefix + (",\n" if self._count else "\n") + line + "\n]")
                     await output.truncate()
                 self._count += 1
+            return 1
 
     async def close(self) -> None:
         self._closed = True
@@ -117,7 +118,7 @@ class CSVStorage(DataStorage):
         self.delimiter = delimiter
         self._lock = __import__("asyncio").Lock()
 
-    async def save(self, data: dict) -> None:
+    async def save(self, data: dict) -> int:
         record = _record(data)
         record["links"] = json.dumps(record["links"], ensure_ascii=False, separators=(",", ":"))
         record["metadata"] = json.dumps(record["metadata"], ensure_ascii=False, separators=(",", ":"))
@@ -131,6 +132,7 @@ class CSVStorage(DataStorage):
                     writer.writeheader()
                 writer.writerow(record)
                 await output.write(buffer.getvalue())
+            return 1
 
     async def close(self) -> None:
         return None
@@ -160,7 +162,7 @@ class SQLiteStorage(DataStorage):
         await self._connection.execute("CREATE INDEX IF NOT EXISTS idx_pages_crawled_at ON pages(crawled_at)")
         await self._connection.commit()
 
-    async def save(self, data: dict) -> None:
+    async def save(self, data: dict) -> int:
         record = _record(data)
         row = (record["url"], record["title"], record["text"],
                json.dumps(record["links"], ensure_ascii=False),
@@ -168,11 +170,13 @@ class SQLiteStorage(DataStorage):
                record["status_code"], record["content_type"])
         async with self._lock:
             await self.init_db()
-            self._pending.append(row)
+            if row not in self._pending:
+                self._pending.append(row)
             if len(self._pending) >= self.batch_size:
-                await self._flush()
+                return await self._flush()
+            return 0
 
-    async def _flush(self) -> None:
+    async def _flush(self) -> int:
         if self._pending:
             rows, self._pending = self._pending, []
             try:
@@ -182,6 +186,14 @@ class SQLiteStorage(DataStorage):
             except Exception:
                 self._pending = rows + self._pending
                 raise
+            return len(rows)
+        return 0
+
+    async def flush(self) -> int:
+        """Commit pending rows and return the number confirmed by SQLite."""
+        async with self._lock:
+            await self.init_db()
+            return await self._flush()
 
     async def fetch_all(self) -> list[dict]:
         """Read persisted records back as standardized dictionaries."""
@@ -193,10 +205,14 @@ class SQLiteStorage(DataStorage):
             await cursor.close()
         return [dict(zip(FIELDS, row[:3] + (json.loads(row[3]), json.loads(row[4])) + row[5:])) for row in rows]
 
-    async def close(self) -> None:
+    async def close(self) -> int:
         async with self._lock:
             if self._connection is not None:
-                await self._flush()
-                await self._connection.close()
-                self._connection = None
+                connection = self._connection
+                try:
+                    return await self._flush()
+                finally:
+                    await connection.close()
+                    self._connection = None
+        return 0
 

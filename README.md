@@ -15,16 +15,16 @@ pip install -r requirements.txt
 ## CLI
 
 ```bash
-python main.py --urls https://example.com/ --max-pages 20 --max-depth 1 \
+.venv/bin/python -m src.main --urls https://example.com/ --max-pages 20 --max-depth 1 \
   --rate-limit 2 --respect-robots --output pages.json
-python main.py --config crawler.json
+.venv/bin/python -m src.main --config crawler.json
 ```
 
-`--urls` accepts one or more page URLs or sitemap XML URLs. `--output` selects JSON Lines (`.json`/`.jsonl`), CSV (`.csv`), or SQLite (`.sqlite`/`.db`) storage. The command writes `crawl_report.html`, `crawl_stats.json`, and a rotating `crawler.log` by default. Run the older focused demonstrations with `python main.py 1` through `python main.py 6`.
+`--urls` accepts one or more page URLs or sitemap XML URLs. `--output` selects JSON Lines (`.json`/`.jsonl`), CSV (`.csv`), or SQLite (`.sqlite`/`.db`) storage. The command writes `crawl_report.html`, `crawl_stats.json`, and a rotating `crawler.log` by default. Run the older focused demonstrations with `.venv/bin/python -m src.main 1` through `.venv/bin/python -m src.main 6`.
 
 ## Configuration
 
-The CLI accepts JSON configuration. Values supplied on the command line override values in the file; omitted command-line options retain file settings. The explicit `--output` path replaces the configured storage entry. `python main.py 7` runs the complete example configured in `crawler.example.json`.
+The CLI accepts JSON configuration. Values supplied on the command line override values in the file; omitted command-line options retain file settings. The explicit `--output` path replaces the configured storage entry. `.venv/bin/python -m src.main 7` runs the complete example configured in `crawler.example.json`.
 
 ```json
 {
@@ -58,4 +58,4 @@ Storage implementations live in `storage.py`: `JSONStorage`, `CSVStorage`, and `
 
 ## Performance notes
 
-`performance.py` runs a deterministic local HTTP benchmark at 100, 500, and 1,000 pages. It compares bounded asynchronous crawling with a sequential `urllib` baseline and records elapsed time, throughput, and peak Python allocation measured by `tracemalloc` in `PERFORMANCE.md`. Local measurements isolate crawler overhead from internet variability; throughput is controlled by the configured rate limiter, so use a high rate for the benchmark.
+`.venv/bin/python -m src.performance` runs a deterministic local HTTP benchmark at 100, 500, and 1,000 pages. It compares bounded asynchronous crawling with a sequential `urllib` baseline and records elapsed time, throughput, and peak Python allocation measured by `tracemalloc` in `PERFORMANCE.md`. Local measurements isolate crawler overhead from internet variability; throughput is controlled by the configured rate limiter, so use a high rate for the benchmark.

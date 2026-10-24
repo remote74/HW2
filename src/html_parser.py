@@ -1,7 +1,7 @@
 """Tolerant HTML parsing and structured page extraction."""
 
 import logging
-from urllib.parse import urljoin, urlsplit
+from urllib.parse import urldefrag, urljoin, urlsplit
 
 from bs4 import BeautifulSoup
 
@@ -55,6 +55,7 @@ class HTMLParser:
             if not href:
                 continue
             absolute = urljoin(base_url, href)
+            absolute = urldefrag(absolute).url
             if self._valid_url(absolute) and absolute not in seen:
                 links.append(absolute)
                 seen.add(absolute)

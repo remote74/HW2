@@ -11,7 +11,7 @@ from datetime import datetime, timezone
 from collections import Counter
 from contextlib import asynccontextmanager
 from typing import Sequence
-from urllib.parse import urlsplit
+from urllib.parse import urlsplit, urldefrag
 from urllib.robotparser import RobotFileParser
 
 import aiohttp
@@ -70,8 +70,7 @@ class RetryStrategy:
         multiplier = 2 if isinstance(error, TransientError) and getattr(error, "status", None) == 429 else 1
         return factor * (2 ** (retry_number - 1)) * multiplier
 
-    async def execute_with_retry(self, coro, args=(), kwargs=None):
-        kwargs = kwargs or {}
+    async def execute_with_retry(self, coro, *args, **kwargs):
         attempts_by_type = Counter()
         attempt = 0
         while True:
@@ -82,18 +81,20 @@ class RetryStrategy:
                 retryable = isinstance(error, self.retry_on) and not isinstance(error, PermanentError)
                 attempts_by_type[type(error)] += 1
                 limit = self._limit_for(error)
-                delay = self._delay_for(error, attempts_by_type[type(error)]) if retryable and attempts_by_type[type(error)] <= limit else 0.0
-                record = {"url": kwargs.get("url", ""), "attempt": attempt,
+                should_retry = retryable and attempts_by_type[type(error)] <= limit
+                delay = self._delay_for(error, attempts_by_type[type(error)]) if should_retry else 0.0
+                record = {"url": kwargs.get("url", args[0] if args else ""), "attempt": attempt,
                           "error_type": type(error).__name__, "error": str(error), "delay": delay}
                 self.attempts.append(record)
                 logger.warning("Request attempt url=%s attempt=%d error_type=%s delay=%.3fs error=%s",
                                record["url"], attempt, record["error_type"], delay, error)
                 if self.on_attempt:
                     self.on_attempt(error, record)
-                if delay <= 0:
+                if not should_retry:
                     raise
                 self.wait_times.append(delay)
-                await asyncio.sleep(delay)
+                if delay > 0:
+                    await asyncio.sleep(delay)
             else:
                 return result
 
@@ -169,7 +170,7 @@ class RobotsParser:
         # RobotFileParser may expose crawl_delay in newer Python versions. The
         # parser is domain-specific, so use the most recently fetched entry when
         # called directly; crawler code passes its domain through _delay_for.
-        agent = (user_agent or self.user_agent).lower()
+        agent = (user_agent or self.user_agent).split("/", 1)[0].lower()
         delays = [item["crawl_delays"].get(agent, item["crawl_delays"].get("*"))
                   for item in self._cache.values()]
         return float(next((delay for delay in delays if delay is not None), 0.0))
@@ -179,7 +180,7 @@ class RobotsParser:
         if not rules:
             return 0.0
         delays = rules["crawl_delays"]
-        agent = (user_agent or self.user_agent).lower()
+        agent = (user_agent or self.user_agent).split("/", 1)[0].lower()
         delay = delays.get(agent, delays.get("*"))
         return float(delay or 0.0)
 
@@ -189,6 +190,7 @@ class RobotsParser:
         # expose on every supported Python release. Track group agents directly.
         result = {}
         agents = []
+        group_has_directive = False
         for raw in lines:
             line = raw.split("#", 1)[0].strip()
             if not line or ":" not in line:
@@ -196,15 +198,19 @@ class RobotsParser:
             name, value = (part.strip() for part in line.split(":", 1))
             if name.lower() == "user-agent":
                 agent = value.lower()
-                if agents and agent in result:
+                if group_has_directive:
                     agents = []
+                    group_has_directive = False
                 agents.append(agent)
             elif name.lower() == "crawl-delay" and agents:
                 try:
                     for agent in agents:
                         result[agent] = float(value)
+                    group_has_directive = True
                 except ValueError:
                     continue
+            elif name.lower() not in {"user-agent"} and agents:
+                group_has_directive = True
         return result
 
     @staticmethod
@@ -319,6 +325,7 @@ class AsyncCrawler:
         self.storage = storage
         self.storage_stats = {"saved": 0, "failed": 0}
         self._response_info = {}
+        self.status_codes = Counter()
         self.max_depth = max_depth
         self.semaphore_manager = SemaphoreManager(max_concurrent, per_domain_concurrent)
         self.queue = CrawlerQueue()
@@ -374,13 +381,17 @@ class AsyncCrawler:
                     combined_delay = required + random.uniform(0.0, self.jitter)
                     await self.rate_limiter.acquire(domain, combined_delay)
                     session = await self._get_session()
-                    multiplier = 1 + max(0, attempt_number - 1) * 0.5
-                    timeout = aiohttp.ClientTimeout(total=self.total_timeout * multiplier,
-                        connect=self.connect_timeout * multiplier, sock_read=self.read_timeout * multiplier)
+                    configured = session.timeout
+                    timeout = aiohttp.ClientTimeout(
+                        total=configured.total or self.total_timeout,
+                        connect=configured.connect or self.connect_timeout,
+                        sock_read=configured.sock_read or self.read_timeout)
                     async with self._request_lock:
                         self.request_timestamps.append(time.perf_counter())
                     try:
                         async with session.get(url, headers={"User-Agent": self.user_agent}, timeout=timeout) as response:
+                            self.status_codes[response.status] += 1
+                            self._response_info[url] = (response.status, response.headers.get("Content-Type", ""))
                             if response.status in (401, 403, 404):
                                 raise PermanentError(f"HTTP {response.status} for {url}")
                             if response.status in (429, 500, 503):
@@ -390,7 +401,6 @@ class AsyncCrawler:
                             if response.status >= 400:
                                 raise PermanentError(f"HTTP {response.status} for {url}")
                             body = await response.text()
-                            self._response_info[url] = (response.status, response.headers.get("Content-Type", ""))
                             logger.info("Request succeeded url=%s status=%s", url, response.status)
                             return body
                     except (PermanentError, TransientError, asyncio.TimeoutError):
@@ -402,7 +412,7 @@ class AsyncCrawler:
                     except aiohttp.ClientError as exc:
                         raise NetworkError(str(exc)) from exc
                 try:
-                    result = await self.retry_strategy.execute_with_retry(request, (), {"url": url})
+                    result = await self.retry_strategy.execute_with_retry(request, url)
                     if attempt_number > 1:
                         self.successful_retries += 1
                     self.retry_strategy.attempts.append({"url": url, "attempt": attempt_number,
@@ -458,8 +468,16 @@ class AsyncCrawler:
 
     async def crawl(self, start_urls: list[str], max_pages: int = 100, *, max_depth: int | None = None,
                     same_domain_only: bool = False, exclude_patterns: Sequence[str] | None = None,
-                    include_patterns: Sequence[str] | None = None, progress_callback=None) -> dict:
-        """Crawl linked pages with bounded workers, depth and URL filters."""
+                    include_patterns: Sequence[str] | None = None, progress_callback=None,
+                    _reset_status_codes: bool = True) -> dict:
+        """Crawl linked pages with bounded workers, depth and URL filters.
+
+        Progress callbacks receive ``total`` as the number of URLs accepted so
+        far. It grows as pages reveal links, so the displayed percentage stays
+        bounded while the ETA estimates the work currently known to the queue.
+        """
+        if _reset_status_codes:
+            self.status_codes.clear()
         if max_pages < 1:
             return {}
         depth_limit = self.max_depth if max_depth is None else max_depth
@@ -468,7 +486,8 @@ class AsyncCrawler:
         self.queue = CrawlerQueue()
         self.visited_urls, self.failed_urls, self.processed_urls = set(), {}, {}
         self.url_depths = {}
-        self.progress = {"processed": 0, "queue_size": 0, "failures": 0, "pages_per_second": 0.0}
+        self.progress = {"processed": 0, "queue_size": 0, "failures": 0,
+                         "pages_per_second": 0.0, "total": 0}
         seeds = list(dict.fromkeys(start_urls))
         seed_domains = {urlsplit(url).netloc.lower() for url in seeds}
         scheduled = set()
@@ -490,6 +509,7 @@ class AsyncCrawler:
 
         async def enqueue(url, depth):
             nonlocal pending, accepted
+            url = urldefrag(url)[0]
             if depth > depth_limit or not allowed(url) or url in scheduled or accepted >= max_pages:
                 return
             scheduled.add(url)
@@ -519,18 +539,15 @@ class AsyncCrawler:
                     continue
                 try:
                     result = await self.fetch_and_parse(url)
-                    if not result.get("text") and not result.get("title") and not result.get("links"):
+                    status_code = result.get("status_code")
+                    if status_code is None or status_code >= 400 or "error" in result:
                         self.failed_urls[url] = self.error_details.get(
                             url, {}).get("message", "Request failed or returned no parseable content")
                         self.queue.mark_failed(url, self.failed_urls[url])
                     else:
                         if self.storage is not None:
-                            try:
-                                await self.storage.save(result)
-                                self.storage_stats["saved"] += 1
-                            except Exception as exc:
-                                self.storage_stats["failed"] += 1
-                                logger.exception("Page storage failed url=%s error=%s", url, exc)
+                            saved = await self._save_with_retry(result, url)
+                            self.storage_stats["saved"] += saved
                         self.processed_urls[url] = result
                         self.queue.mark_processed(url)
                         for link in result.get("links", []):
@@ -545,14 +562,45 @@ class AsyncCrawler:
                     wake.set()
                     elapsed = max(time.perf_counter() - started, 1e-9)
                     self.progress = {"processed": len(self.processed_urls), "queue_size": self.queue.get_stats()["queued"],
-                                     "failures": len(self.failed_urls), "pages_per_second": len(self.processed_urls) / elapsed}
+                                     "failures": len(self.failed_urls), "pages_per_second":
+                                     (len(self.processed_urls) + len(self.failed_urls)) / elapsed,
+                                     "total": accepted}
                     if progress_callback:
                         value = progress_callback(dict(self.progress))
                         if asyncio.iscoroutine(value):
                             await value
 
         await asyncio.gather(*(worker() for _ in range(workers)))
+        if self.storage is not None and callable(getattr(self.storage, "flush", None)):
+            for attempt in range(1, self.max_retries + 2):
+                try:
+                    self.storage_stats["saved"] += int(await self.storage.flush() or 0)
+                    break
+                except Exception as exc:
+                    if attempt > self.max_retries:
+                        self.storage_stats["failed"] += 1
+                        logger.exception("Final storage batch flush failed")
+                        break
+                    delay = self.backoff_factor * (2 ** (attempt - 1))
+                    logger.warning("Storage flush retry attempt=%d delay=%.3fs error=%s", attempt, delay, exc)
+                    if delay:
+                        await asyncio.sleep(delay)
         return dict(self.processed_urls)
+
+    async def _save_with_retry(self, result: dict, url: str) -> int:
+        for attempt in range(1, self.max_retries + 2):
+            try:
+                saved = await self.storage.save(result)
+                return int(saved if saved is not None else 1)
+            except Exception as exc:
+                if attempt > self.max_retries:
+                    self.storage_stats["failed"] += 1
+                    logger.exception("Page storage failed after retries url=%s", url)
+                    return 0
+                delay = self.backoff_factor * (2 ** (attempt - 1))
+                logger.warning("Storage save retry url=%s attempt=%d delay=%.3fs error=%s", url, attempt, delay, exc)
+                if delay:
+                    await asyncio.sleep(delay)
 
     async def close(self) -> None:
         """Close the pooled session, if one has been created."""
@@ -560,8 +608,10 @@ class AsyncCrawler:
             await self._session.close()
         if self.storage is not None:
             try:
-                await self.storage.close()
+                flushed = await self.storage.close()
+                self.storage_stats["saved"] += int(flushed or 0)
             except Exception:
+                self.storage_stats["failed"] += 1
                 logger.exception("Failed to close configured storage")
 
     async def __aenter__(self) -> "AsyncCrawler":

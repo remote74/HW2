@@ -21,9 +21,10 @@ from src.storage import JSONStorage, CSVStorage, SQLiteStorage
 
 class SitemapParser:
     """Fetch sitemap XML asynchronously and recursively expand indexes."""
-    def __init__(self, session: aiohttp.ClientSession | None = None):
+    def __init__(self, session: aiohttp.ClientSession | None = None, request_fetcher=None):
         self.session = session
         self._owns_session = session is None
+        self.request_fetcher = request_fetcher
 
     async def fetch_sitemap(self, sitemap_url: str) -> list[str]:
         visited_maps, urls = set(), []
@@ -31,13 +32,18 @@ class SitemapParser:
             if url in visited_maps:
                 return
             visited_maps.add(url)
-            session = self.session
-            if session is None:
-                session = aiohttp.ClientSession()
-                self.session = session
-            async with session.get(url) as response:
-                response.raise_for_status()
-                body = await response.read()
+            if self.request_fetcher is not None:
+                body = (await self.request_fetcher(url)).encode("utf-8")
+                if not body:
+                    raise aiohttp.ClientError(f"Could not fetch sitemap {url}")
+            else:
+                session = self.session
+                if session is None:
+                    session = aiohttp.ClientSession()
+                    self.session = session
+                async with session.get(url) as response:
+                    response.raise_for_status()
+                    body = await response.read()
             try:
                 root = ET.fromstring(body)
             except ET.ParseError as exc:
@@ -47,7 +53,10 @@ class SitemapParser:
                     if node.tag.rsplit("}", 1)[-1].lower() == "loc"]
             if kind == "sitemapindex":
                 for nested in locs:
-                    await fetch(nested)
+                    try:
+                        await fetch(nested)
+                    except (aiohttp.ClientError, asyncio.TimeoutError, ValueError) as exc:
+                        logging.getLogger(__name__).warning("Skipping unavailable nested sitemap url=%s error=%s", nested, exc)
             elif kind == "urlset":
                 urls.extend(loc for loc in locs if loc.startswith(("http://", "https://")))
             else:
@@ -71,16 +80,18 @@ class CrawlerStats:
         self.status_codes = Counter()
         self.domains = Counter()
 
-    def record(self, pages: dict, failures: dict):
+    def record(self, pages: dict, failures: dict, status_codes: dict | None = None):
         self.successful_requests = len(pages)
         self.failed_requests = len(failures)
         self.status_codes.clear()
         self.domains.clear()
         for url, page in pages.items():
             status = page.get("status_code")
-            if status is not None:
+            if status_codes is None and status is not None:
                 self.status_codes[str(status)] += 1
             self.domains[urlsplit(url).netloc.lower()] += 1
+        if status_codes is not None:
+            self.status_codes.update({str(code): count for code, count in status_codes.items()})
         self.finished_at = time.perf_counter()
 
     def as_dict(self):
@@ -148,32 +159,36 @@ class AdvancedCrawler:
 
     @staticmethod
     def _print_progress(progress):
-        total = progress.get("total", 0)
+        total = max(progress.get("total", 0), progress["processed"] + progress["failures"])
         done = progress["processed"] + progress["failures"]
         rate = progress.get("pages_per_second", 0)
         eta = max(0, total - done) / rate if rate else 0
-        print(f"\r{done}/{total} ({100*done/total if total else 100:.1f}%) | {rate:.2f} pages/s | ETA {eta:.1f}s | active {progress.get('active_tasks', 0)}", end="", flush=True)
+        percent = min(100.0, 100 * done / total) if total else 100.0
+        print(f"\r{done}/{total} ({percent:.1f}%) | {rate:.2f} pages/s | ETA {eta:.1f}s | active {progress.get('active_tasks', 0)}", end="", flush=True)
 
     async def crawl(self, urls: list[str] | None = None, *, max_pages=None, max_depth=None):
+        self.crawler.status_codes.clear()
         urls = list(urls if urls is not None else self.config.get("urls", []))
-        sitemap_parser = SitemapParser()
+        sitemap_parser = SitemapParser(request_fetcher=self.crawler.fetch_url)
         expanded = []
         for url in urls:
             if urlsplit(url).path.lower().endswith(".xml") or "sitemap" in urlsplit(url).path.lower():
-                expanded.extend(await sitemap_parser.fetch_sitemap(url))
+                try:
+                    expanded.extend(await sitemap_parser.fetch_sitemap(url))
+                except (aiohttp.ClientError, asyncio.TimeoutError, ValueError) as exc:
+                    logging.getLogger(__name__).warning("Skipping sitemap url=%s error=%s", url, exc)
             else:
                 expanded.append(url)
         urls = list(dict.fromkeys(expanded))
         self.stats = CrawlerStats()
         def progress(value):
-            value["total"] = min(max_pages or self.config.get("max_pages", 100), len(urls))
             value["active_tasks"] = len(self.crawler.semaphore_manager.active_tasks)
             self.progress_callback(value)
         result = await self.crawler.crawl(urls, max_pages=max_pages or self.config.get("max_pages", 100),
             max_depth=max_depth, same_domain_only=self.config.get("same_domain_only", False),
             include_patterns=self.config.get("include_patterns"), exclude_patterns=self.config.get("exclude_patterns"),
-            progress_callback=progress)
-        self.stats.record(result, self.crawler.failed_urls)
+            progress_callback=progress, _reset_status_codes=False)
+        self.stats.record(result, self.crawler.failed_urls, self.crawler.status_codes)
         if self.progress_callback == self._print_progress:
             print()
         return result

@@ -1,17 +1,18 @@
 """Runnable demonstration for Stage 1: asynchronous HTTP fetching."""
 
-import asyncio
 import argparse
+import asyncio
+import csv
+import json
 import logging
 import time
-import json
-import csv
+
 import aiofiles
+from aiohttp import web
 
 from src.async_crawler import AsyncCrawler
-from aiohttp import web
-from src.storage import JSONStorage, CSVStorage, SQLiteStorage
 from src.stage7 import main as stage7_main
+from src.storage import CSVStorage, JSONStorage, SQLiteStorage
 
 
 async def demonstrate_stage_1() -> None:
