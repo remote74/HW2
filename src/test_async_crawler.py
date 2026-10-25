@@ -47,14 +47,16 @@ class AsyncCrawlerTests(unittest.IsolatedAsyncioTestCase):
             await crawler.close()
         self.assertTrue(crawler._session.closed)
 
-    async def test_timeout_is_an_individual_failure(self):
+    async def test_custom_session_timeout_grows_on_retry(self):
         crawler = AsyncCrawler()
         crawler._session = __import__("aiohttp").ClientSession(
             # Long enough for the 80 ms success handler, but shorter than /slow.
             timeout=__import__("aiohttp").ClientTimeout(total=0.12)
         )
         try:
-            self.assertEqual(await crawler.fetch_url(self.base_url + "/slow"), "")
+            # The initial 120 ms limit is too short, but its retry doubles it
+            # and allows the 200 ms response to complete.
+            self.assertEqual(await crawler.fetch_url(self.base_url + "/slow"), "too late")
             self.assertEqual(await crawler.fetch_url(self.base_url + "/ok"), "page body")
         finally:
             await crawler.close()

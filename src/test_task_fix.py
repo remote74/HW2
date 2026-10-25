@@ -1,7 +1,9 @@
 import tempfile
+import asyncio
 import unittest
 from pathlib import Path
 
+import aiohttp
 from aiohttp import web
 from aiohttp.test_utils import TestServer
 
@@ -12,6 +14,86 @@ from src.storage import SQLiteStorage
 
 
 class FixRegressionTests(unittest.IsolatedAsyncioTestCase):
+    async def test_second_crawl_timeout_does_not_reuse_previous_response_status(self):
+        calls = 0
+        stored = []
+
+        async def page(_request):
+            nonlocal calls
+            calls += 1
+            if calls == 1:
+                return web.Response(text="first response", content_type="text/html")
+            await asyncio.sleep(0.08)
+            return web.Response(text="too late", content_type="text/html")
+
+        app = web.Application()
+        app.router.add_get("/", page)
+        server = TestServer(app)
+        await server.start_server()
+
+        class Storage:
+            async def save(self, record):
+                stored.append(record)
+                return 1
+
+            async def close(self):
+                return 0
+
+        crawler = AsyncCrawler(respect_robots=False, requests_per_second=100,
+                               total_timeout=0.02, connect_timeout=0.02,
+                               read_timeout=0.02, max_retries=0, storage=Storage())
+        url = str(server.make_url("/"))
+        try:
+            first = await crawler.crawl([url], max_pages=1)
+            self.assertIn(url, first)
+            self.assertEqual(first[url]["status_code"], 200)
+
+            second = await crawler.crawl([url], max_pages=1)
+            self.assertEqual(second, {})
+            self.assertIn(url, crawler.failed_urls)
+            self.assertNotIn(url, crawler.processed_urls)
+            self.assertEqual([record["status_code"] for record in stored], [200])
+        finally:
+            await crawler.close()
+            await server.close()
+
+    async def test_retry_timeout_grows_for_default_and_custom_sessions(self):
+        async def slow_page(_request):
+            await asyncio.sleep(0.035)
+            return web.Response(text="eventually ready", content_type="text/html")
+
+        app = web.Application()
+        app.router.add_get("/", slow_page)
+        server = TestServer(app)
+        await server.start_server()
+        url = str(server.make_url("/"))
+
+        default_crawler = AsyncCrawler(respect_robots=False, requests_per_second=100,
+                                      total_timeout=0.02, connect_timeout=0.2,
+                                      read_timeout=0.02, max_retries=1,
+                                      backoff_factor=0)
+        custom_crawler = AsyncCrawler(respect_robots=False, requests_per_second=100,
+                                      max_retries=1, backoff_factor=0)
+        base_timeout = aiohttp.ClientTimeout(total=0.02, connect=None,
+                                             sock_connect=None, sock_read=None)
+        custom_crawler._session = aiohttp.ClientSession(timeout=base_timeout)
+        try:
+            self.assertEqual(await default_crawler.fetch_url(url), "eventually ready")
+            self.assertEqual(await custom_crawler.fetch_url(url), "eventually ready")
+            self.assertEqual(len([item for item in default_crawler.retry_strategy.attempts
+                                  if item.get("error_type")]), 1)
+            self.assertEqual(len([item for item in custom_crawler.retry_strategy.attempts
+                                  if item.get("error_type")]), 1)
+            self.assertIs(custom_crawler._session.timeout, base_timeout)
+            self.assertEqual(custom_crawler._session.timeout.total, 0.02)
+            self.assertIsNone(custom_crawler._session.timeout.connect)
+            self.assertIsNone(custom_crawler._session.timeout.sock_connect)
+            self.assertIsNone(custom_crawler._session.timeout.sock_read)
+        finally:
+            await default_crawler.close()
+            await custom_crawler.close()
+            await server.close()
+
     async def test_retry_forwards_arguments_and_zero_backoff_retries(self):
         strategy = RetryStrategy(max_retries=2, backoff_factor=0)
         calls = []

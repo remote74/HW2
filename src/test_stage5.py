@@ -25,7 +25,7 @@ class Stage5Tests(unittest.IsolatedAsyncioTestCase):
                 raise TransientError("temporary")
             return "ok"
 
-        with patch("async_crawler.asyncio.sleep", side_effect=sleep):
+        with patch("src.async_crawler.asyncio.sleep", side_effect=sleep):
             self.assertEqual(await strategy.execute_with_retry(flaky), "ok")
         self.assertEqual(sleeps, [0.01, 0.02])
 
@@ -73,10 +73,11 @@ class Stage5Tests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.hits["/missing"], 1)
         self.assertEqual(self.crawler.get_stats()["permanent_error_urls"], [self.root + "/missing"])
 
-    async def test_timeout_is_retried_and_bounded(self):
-        self.assertEqual(await self.crawler.fetch_url(self.root + "/slow"), "")
+    async def test_timeout_grows_on_retry_and_retry_count_is_bounded(self):
+        self.assertEqual(await self.crawler.fetch_url(self.root + "/slow"), "ok")
         self.assertEqual(self.hits["/slow"], 3)
-        self.assertEqual(self.crawler.get_stats()["errors_by_type"], {"TimeoutError": 3})
+        self.assertEqual(self.crawler.get_stats()["errors_by_type"], {"TimeoutError": 2})
+        self.assertEqual(self.crawler.get_stats()["successful_retries"], 1)
 
 
 if __name__ == "__main__":

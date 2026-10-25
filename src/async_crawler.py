@@ -324,7 +324,6 @@ class AsyncCrawler:
         self.html_parser = html_parser or HTMLParser()
         self.storage = storage
         self.storage_stats = {"saved": 0, "failed": 0}
-        self._response_info = {}
         self.status_codes = Counter()
         self.max_depth = max_depth
         self.semaphore_manager = SemaphoreManager(max_concurrent, per_domain_concurrent)
@@ -337,12 +336,15 @@ class AsyncCrawler:
 
     async def fetch_and_parse(self, url: str) -> dict:
         """Fetch and parse a page, preserving its source URL on failures."""
-        html = await self.fetch_url(url)
+        html, response_info, fetch_succeeded = await self._fetch_url(url)
         try:
             page = await self.html_parser.parse_html(html, url)
-            status_code, content_type = self._response_info.get(url, (None, ""))
+            status_code, content_type = response_info or (None, "")
             page.update({"crawled_at": datetime.now(timezone.utc), "status_code": status_code,
                          "content_type": content_type})
+            if not fetch_succeeded:
+                page["error"] = self.error_details.get(url, {}).get(
+                    "message", "Request failed or was blocked before receiving a response")
             return page
         except Exception as exc:
             error = ParseError(str(exc))
@@ -362,6 +364,11 @@ class AsyncCrawler:
 
     async def fetch_url(self, url: str) -> str:
         """Fetch one URL; return its body, or ``""`` on an expected failure."""
+        body, _response_info, _fetch_succeeded = await self._fetch_url(url)
+        return body
+
+    async def _fetch_url(self, url: str) -> tuple[str, tuple[int, str] | None, bool]:
+        """Fetch one URL and return response metadata scoped to this invocation."""
         logger.info("Starting request url=%s", url)
         parts = urlsplit(url)
         domain = parts.netloc.lower()
@@ -370,28 +377,38 @@ class AsyncCrawler:
             if not self.robots_parser.can_fetch(url, self.user_agent):
                 self.robots_blocked += 1
                 logger.info("Blocked by robots.txt url=%s", url)
-                return ""
+                return "", None, False
         try:
             async with self._semaphore, self.semaphore_manager.limit(url):
                 attempt_number = 0
+                attempt_response_info = None
                 async def request(url):
-                    nonlocal attempt_number
+                    nonlocal attempt_number, attempt_response_info
                     attempt_number += 1
+                    # Metadata belongs to one attempt only. A timeout before a
+                    # response must not inherit a prior response for this URL.
+                    attempt_response_info = None
                     required = max(self.min_delay, self.robots_parser._delay_for(url, self.user_agent))
                     combined_delay = required + random.uniform(0.0, self.jitter)
                     await self.rate_limiter.acquire(domain, combined_delay)
                     session = await self._get_session()
                     configured = session.timeout
+                    multiplier = 2 ** (attempt_number - 1)
+
+                    def scaled(value):
+                        return None if value is None else value * multiplier
+
                     timeout = aiohttp.ClientTimeout(
-                        total=configured.total or self.total_timeout,
-                        connect=configured.connect or self.connect_timeout,
-                        sock_read=configured.sock_read or self.read_timeout)
+                        total=scaled(configured.total),
+                        connect=scaled(configured.connect),
+                        sock_connect=scaled(configured.sock_connect),
+                        sock_read=scaled(configured.sock_read))
                     async with self._request_lock:
                         self.request_timestamps.append(time.perf_counter())
                     try:
                         async with session.get(url, headers={"User-Agent": self.user_agent}, timeout=timeout) as response:
                             self.status_codes[response.status] += 1
-                            self._response_info[url] = (response.status, response.headers.get("Content-Type", ""))
+                            attempt_response_info = (response.status, response.headers.get("Content-Type", ""))
                             if response.status in (401, 403, 404):
                                 raise PermanentError(f"HTTP {response.status} for {url}")
                             if response.status in (429, 500, 503):
@@ -418,16 +435,16 @@ class AsyncCrawler:
                     self.retry_strategy.attempts.append({"url": url, "attempt": attempt_number,
                                                          "error_type": None, "error": None, "delay": 0.0,
                                                          "outcome": "success"})
-                    return result
+                    return result, attempt_response_info, True
                 except (PermanentError, TransientError, NetworkError, asyncio.TimeoutError) as exc:
                     self.error_details[url] = {"type": type(exc).__name__, "message": str(exc)}
                     if isinstance(exc, PermanentError):
                         self.permanent_error_urls.add(url)
                     logger.error("Request failed url=%s error_type=%s error=%s", url, type(exc).__name__, exc)
-                    return ""
+                    return "", attempt_response_info, False
         except (aiohttp.ClientError, asyncio.TimeoutError) as exc:
             logger.error("Request failed url=%s error_type=%s error=%s", url, type(exc).__name__, exc)
-            return ""
+            return "", None, False
 
     def get_stats(self) -> dict:
         stamps = self.request_timestamps
